@@ -108,30 +108,307 @@ class Attention(nn.Module):
         self.dropout = config.dropout
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention') and config.flash_attn
 
+
+
+
+
+############################################################################################################
     def forward(self, x, position_embeddings, past_key_value=None, use_cache=False, attention_mask=None):
         bsz, seq_len, _ = x.shape
-        xq, xk, xv = self.q_proj(x), self.k_proj(x), self.v_proj(x)
+
+        # ------------------------------------------------------------
+        # 1. QKV projection
+        # ------------------------------------------------------------
+        xq = self.q_proj(x)
+        xk = self.k_proj(x)
+        xv = self.v_proj(x)
+
         xq = xq.view(bsz, seq_len, self.n_local_heads, self.head_dim)
         xk = xk.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
         xv = xv.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
+
         xq, xk = self.q_norm(xq), self.k_norm(xk)
+
         cos, sin = position_embeddings
         xq, xk = apply_rotary_pos_emb(xq, xk, cos, sin)
+
+        # ------------------------------------------------------------
+        # 2. KV cache
+        #
+        # Closure attention cache format:
+        #
+        #   past_key_value = None
+        #
+        # or:
+        #
+        #   past_key_value = (past_k, past_v, past_y)
+        #
+        # where:
+        #   past_k: [B, past_len, n_local_kv_heads, D]
+        #   past_v: [B, past_len, n_local_kv_heads, D]
+        #   past_y: [B, n_local_heads, past_len, D]
+        #
+        # past_y is the cached closure output:
+        #
+        #   y_i = a_i @ V
+        #
+        # not the explicit distribution a_i.
+        # ------------------------------------------------------------
+        past_y = None
+
         if past_key_value is not None:
-            xk = torch.cat([past_key_value[0], xk], dim=1)
-            xv = torch.cat([past_key_value[1], xv], dim=1)
-        past_kv = (xk, xv) if use_cache else None
-        xq, xk, xv = (xq.transpose(1, 2), repeat_kv(xk, self.n_rep).transpose(1, 2), repeat_kv(xv, self.n_rep).transpose(1, 2))
-        if self.flash and (seq_len > 1) and (not self.is_causal or past_key_value is None) and (attention_mask is None or torch.all(attention_mask == 1)):
-            output = F.scaled_dot_product_attention(xq, xk, xv, dropout_p=self.dropout if self.training else 0.0, is_causal=self.is_causal)
+            past_k = past_key_value[0]
+            past_v = past_key_value[1]
+
+            xk = torch.cat([past_k, xk], dim=1)
+            xv = torch.cat([past_v, xv], dim=1)
+
+            if len(past_key_value) >= 3:
+                past_y = past_key_value[2]
+            elif past_k.shape[1] > 0:
+                raise ValueError(
+                    "Closure attention with KV cache requires past_y. "
+                    "Use past_key_value = (past_k, past_v, past_y)."
+                )
+
+        # Cache raw K/V before repeat_kv.
+        raw_xk = xk
+        raw_xv = xv
+
+        # ------------------------------------------------------------
+        # 3. Head layout
+        # ------------------------------------------------------------
+        xq = xq.transpose(1, 2)                         # [B, H, Q, D]
+        xk = repeat_kv(xk, self.n_rep).transpose(1, 2)  # [B, H, K, D]
+        xv = repeat_kv(xv, self.n_rep).transpose(1, 2)  # [B, H, K, D]
+
+        q_len = xq.shape[-2]
+        k_len = xk.shape[-2]
+        past_len = k_len - q_len
+
+        # ------------------------------------------------------------
+        # 4. QK scores
+        # ------------------------------------------------------------
+        scores = (xq @ xk.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        # scores: [B, H, Q, K]
+
+        # ------------------------------------------------------------
+        # 5. Causal mask
+        #
+        # Query positions correspond to the last q_len positions
+        # in the full key sequence.
+        #
+        # no cache:
+        #   q_len == k_len == T
+        #
+        # decode / cached prefill:
+        #   k_len = past_len + q_len
+        # ------------------------------------------------------------
+        if self.is_causal:
+            q_positions = torch.arange(k_len - q_len, k_len, device=scores.device)
+            k_positions = torch.arange(0, k_len, device=scores.device)
+
+            causal_allowed = k_positions.unsqueeze(0) <= q_positions.unsqueeze(1)
+            # [Q, K]
+
+            scores = scores.masked_fill(
+                ~causal_allowed.unsqueeze(0).unsqueeze(0),
+                float("-inf"),
+            )
+
+        if attention_mask is not None:
+            scores = scores + (1.0 - attention_mask.unsqueeze(1).unsqueeze(2)) * -1e9
+
+        # ------------------------------------------------------------
+        # 6. K_step = one-step evidence kernel
+        #
+        # K_step[:, :, i, j] means:
+        #
+        #   current query token i one-step points to key token j.
+        #
+        # It is not the final attention matrix A.
+        # It is the immediate kernel K.
+        # ------------------------------------------------------------
+        K_step = F.softmax(scores.float(), dim=-1).type_as(xq)
+
+        # Optional dropout.
+        #
+        # Standard attention dropout breaks exact probability normalization.
+        # Since K_step is supposed to be a stochastic kernel, renormalize.
+        if self.training and self.dropout > 0.0:
+            dropped = F.dropout(K_step, p=self.dropout, training=True)
+            denom = dropped.sum(dim=-1, keepdim=True)
+
+            K_step = torch.where(
+                denom > 0,
+                dropped / denom.clamp_min(1e-9),
+                K_step,
+            )
+
+        # ------------------------------------------------------------
+        # 7. Triangular-solve Closure Attention
+        #
+        # Row convention:
+        #
+        #   K_step[..., i, j] = K_{i,j}
+        #
+        # with j <= i after causal masking.
+        #
+        # Define:
+        #
+        #   s_i = K_{i,i}
+        #   K_strict[i,j] = K_{i,j}, j < i
+        #
+        # Recurrence:
+        #
+        #   y_i = s_i v_i + sum_{j<i} K_{i,j} y_j
+        #
+        # Matrix form:
+        #
+        #   Y = S V + K_strict Y
+        #
+        # hence:
+        #
+        #   (I - K_strict) Y = S V
+        #
+        # We solve this triangular system directly, without materializing A.
+        # ------------------------------------------------------------
+
+        if past_y is not None:
+            if past_y.shape[0] != bsz:
+                raise ValueError(f"past_y batch mismatch: got {past_y.shape[0]}, expected {bsz}")
+            if past_y.shape[1] != self.n_local_heads:
+                raise ValueError(f"past_y head mismatch: got {past_y.shape[1]}, expected {self.n_local_heads}")
+            if past_y.shape[-2] != past_len:
+                raise ValueError(f"past_y length mismatch: got {past_y.shape[-2]}, expected {past_len}")
+            if past_y.shape[-1] != self.head_dim:
+                raise ValueError(f"past_y dim mismatch: got {past_y.shape[-1]}, expected {self.head_dim}")
+
+        # Split keys/values into past and current block.
+        #
+        # xv_current:
+        #   [B, H, Q, D]
+        #
+        # K_to_current:
+        #   [B, H, Q, Q]
+        #
+        # K_to_past:
+        #   [B, H, Q, past_len]
+        xv_current = xv[:, :, past_len:, :]
+        K_to_current = K_step[:, :, :, past_len:]
+
+        if past_len > 0:
+            K_to_past = K_step[:, :, :, :past_len]
         else:
-            scores = (xq @ xk.transpose(-2, -1)) / math.sqrt(self.head_dim)
-            if self.is_causal: scores[:, :, :, -seq_len:] += torch.full((seq_len, seq_len), float("-inf"), device=scores.device).triu(1)
-            if attention_mask is not None: scores += (1.0 - attention_mask.unsqueeze(1).unsqueeze(2)) * -1e9
-            output = self.attn_dropout(F.softmax(scores.float(), dim=-1).type_as(xq)) @ xv
-        output = output.transpose(1, 2).reshape(bsz, seq_len, -1)
+            K_to_past = None
+
+        # Self weights s_i are the diagonal of the current block.
+        #
+        # s: [B, H, Q]
+        s = torch.diagonal(K_to_current, dim1=-2, dim2=-1)
+
+        # Strictly lower triangular current-block kernel:
+        #
+        # K_current_strict[i,j] = K_to_current[i,j], j < i
+        #
+        # Shape: [B, H, Q, Q]
+        K_current_strict = torch.tril(K_to_current, diagonal=-1)
+
+        # RHS starts with self contribution:
+        #
+        #   S_new V_new
+        #
+        # Shape: [B, H, Q, D]
+        rhs = s.unsqueeze(-1) * xv_current
+
+        # Add inherited contribution from cached past closure states:
+        #
+        #   K_new,past @ Y_past
+        #
+        # Shape:
+        #   K_to_past: [B, H, Q, past_len]
+        #   past_y:    [B, H, past_len, D]
+        #   inherited: [B, H, Q, D]
+        if past_len > 0:
+            if past_y is None:
+                raise ValueError(
+                    "past_len > 0 but past_y is None. "
+                    "Closure attention needs cached past_y."
+                )
+
+            inherited_from_past = K_to_past @ past_y
+            rhs = rhs + inherited_from_past
+
+        # Build triangular system:
+        #
+        #   M = I - K_current_strict
+        #
+        # M is lower triangular with diagonal 1.
+        #
+        # Shape:
+        #   M:   [B, H, Q, Q]
+        #   rhs: [B, H, Q, D]
+        Q = q_len
+        eye = torch.eye(Q, device=xq.device, dtype=xq.dtype).view(1, 1, Q, Q)
+        M = eye - K_current_strict
+
+        # For numerical stability, solve in fp32 and cast back.
+        # This is usually safer for fp16/bf16 training.
+        solve_in_fp32 = True
+
+        if solve_in_fp32:
+            closure_output = torch.linalg.solve_triangular(
+                M.float(),
+                rhs.float(),
+                upper=False,
+                left=True,
+                unitriangular=True,
+            ).type_as(xq)
+        else:
+            closure_output = torch.linalg.solve_triangular(
+                M,
+                rhs,
+                upper=False,
+                left=True,
+                unitriangular=True,
+            )
+
+        # closure_output: [B, H, Q, D]
+
+        # ------------------------------------------------------------
+        # 8. Cache
+        #
+        # Cache raw K/V before repeat_kv, plus closure_output after
+        # head expansion.
+        #
+        # New cache:
+        #
+        #   (raw_xk, raw_xv, y_cache)
+        #
+        # where:
+        #
+        #   y_cache: [B, H, total_len, D]
+        # ------------------------------------------------------------
+        if use_cache:
+            if past_y is not None:
+                y_cache = torch.cat([past_y, closure_output], dim=-2)
+            else:
+                y_cache = closure_output
+
+            past_kv = (raw_xk, raw_xv, y_cache)
+        else:
+            past_kv = None
+
+        # ------------------------------------------------------------
+        # 9. Output projection
+        # ------------------------------------------------------------
+        output = closure_output.transpose(1, 2).reshape(bsz, seq_len, -1)
         output = self.resid_dropout(self.o_proj(output))
+
         return output, past_kv
+
+
+############################################################################################################   
 
 class FeedForward(nn.Module):
     def __init__(self, config: MiniMindConfig, intermediate_size: int = None):
